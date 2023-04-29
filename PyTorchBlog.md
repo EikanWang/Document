@@ -153,7 +153,7 @@ The `CppVecKernelChecker` class and `CppTile2DKernelChecker` class in CPP codege
 ![image](https://user-images.githubusercontent.com/55483091/235278849-5d4c9b97-abcc-4ccd-96da-b9daae97a622.png)
 ![image](https://user-images.githubusercontent.com/55483091/235278867-8075496e-2f0a-4db2-ab10-c6e1796eab5b.png)
 
-##### index_expr
+##### 1. index_expr
 
 The main limitation for vectorization is the absence of the support related to indices. Presently, the computation on indices is not vectorized, except for cases where a scalar index is broadcasted as a vector, which must remain constant with respect to the loop variable being vectorized. However, this check seems to prevent the vectorization of most index_expr.
 Below is an example from XGLMForCausalLM:
@@ -181,13 +181,13 @@ Below is an example from XGLMForCausalLM:
 In this context, “i1” serves as both the inner-most loop variable and an index expression. To enable vectorization on “i1”, we can set the initialization of “tmp0” with Vectorized::arrange. It’s important to note that this process also necessitates the ability to convert integer masks into floating masks, which is essential for creating a valid “blendv” operation for “where” that defines “tmp7”.
 There are more complicated cases (less frequently occurred than the previous one), e.g., an example from hf_BigBird below. Even though there are complex indices involving index_expr and computation and data loads that make vectorization challenging, there is still an advantage to vectorizing on i2 since the four stores are continuous along that axis. However, we may need to implement a “vectorization with fallback” mechanism to incorporate both scalar and vectorized code into the same loop body. The pull request found at [Inductor] simplify CPP backend Tile2D code by jgong5 · Pull Request #97626 · pytorch/pytorch · GitHub 1 is a part of this effort.
 
-##### to_dtype
+##### 2. to_dtype
 
 At present, we don’t provide support for vectorization of int64 and double data types. Supporting vectorization for these types requires matching the number of vector lanes if we also want to vectorize float32 and/or int32 simultaneously. To accomplish this, we may need to use two vector variables to hold int64 or double vectors to match one float32 or int32 vector variable. The problems with the “to_dtype” function are specifically connected to these two data types. In the majority of real benchmarks, int64 and double are commonly utilized by the calculation of scalar indices, making vectorization unnecessary.
 Below is an example from hrnet_w18. In this particular scenario, we don’t need to vectorize the int64 and double indices since they have no relation to i3, which is the index we want to vectorize. Hence, it suffices to leave them as scalar and not perform vectorization on them.
 
 ```C++
-#pragma omp for 
+        #pragma omp for 
         for(long i0=0; i0<128; i0+=1)
         {
             #pragma GCC ivdep
@@ -227,16 +227,16 @@ Below is an example from hrnet_w18. In this particular scenario, we don’t need
         }
 ```
 
-##### indirect_indexing
+##### 3. indirect_indexing
 
 We exclude all indirect indexing cases from vectorization, but upon observation, we find that we can still vectorize some cases when the indirect index variables remain constant with respect to the loop variables we want to vectorize. One instance of this can be seen in the “dtype” section, where the variable “tmp18” is a load with indirect indices. However, these indices are only dependent on “i1” and “i2” and not on “i3” which is the loop variable we want to vectorize. To obtain this information, we would require an analysis pass to track the relationships between the variables and each loop variable.
 
-##### unsupported masked
+##### 4. unsupported masked
 
 We vectorize the kernel containing “masked” op conservatively and don’t allow any actual computation inside it. This means that cases with nested masked bodies or computations within the “masked” element cannot be vectorized, such as the one found in jx_nest_base. However, in most cases like the example below, enabling vectorization for computation would not pose any issue.
 
 ```C++
-#pragma omp for 
+        #pragma omp for 
         for(long i0=0; i0<32; i0+=1)
         {
             #pragma GCC ivdep
@@ -281,7 +281,7 @@ We vectorize the kernel containing “masked” op conservatively and don’t al
         }
 ```
 
-##### unsupported dtype in load/store
+##### 5. unsupported dtype in load/store
 
 Similarly to the “dtype” case, the int64 and double vectorized data types are unsupported. Supporting vectorization for these types requires matching the number of vector lanes if we also want to vectorize float32 and/or int32 simultaneously. To accomplish this, we may need to use two vector variables to hold int64 or double vectors to match one float32 or int32 vector variable.
 ```C++
@@ -346,7 +346,7 @@ In addition to int64 and double, we only support vectorized bool and uint8 when 
         }
 ```
 
-##### non-contiguous load/store (excluding indirect indexing)
+##### 6. non-contiguous load/store (excluding indirect indexing)
 
 CppTile2DKernel with 2d transposition support has already vectorized some of the non-contiguous load/store. However, there are still two main cases that have not been covered yet. The first case occurs frequently in most models during training backward, where the non-contiguous load/store happens on the inner-most reduction loop while being contiguous on an outer parallel loop, which is known as vertical reduction.
 
@@ -366,11 +366,11 @@ CppTile2DKernel with 2d transposition support has already vectorized some of the
     }
 The second case involves complicated indexing formulas such as floor division (//) or ModularIndexing, and in order to achieve maximum vectorization scope, we must rely on “vectorization with fallback”.
 
-##### unsupported ops
+##### 7. unsupported ops
 
 We currently do not support vectorization for some operations such as bitwise_and, bitwise_or, bitwise_xor, logical_not, remainder, truediv, among others. However, most of these operations should be easy to support. Although there are a few instances of “randn” which are difficult to vectorize, they occur infrequently.
 
-##### unsupported reduction
+##### 8. unsupported reduction
 
 The main reason for the lack of support for reduction operations is primarily attributed to the absence of support for int64 vectorization, e.g., from fastNLP_Bert:
 
@@ -391,11 +391,11 @@ The main reason for the lack of support for reduction operations is primarily at
     }
 ```
 
-##### unsupported constant dtype
+##### 9. unsupported constant dtype
 
 Vectorization is not implemented for constant of data type uint8 or bool. They happen less frequently and can be handled as low priority.
 
-##### unsupported store modes
+##### 10. unsupported store modes
 
 “atomic_add” cannot be vectorized. Still, we can do vectorization with fallback to maximize the performance, e.g., from AlbertForMaskedLM, we are able to vectorize all the ops except for atomic_add which can be put into an inner loop.
 
@@ -411,6 +411,5 @@ The next step, we will continue optimizing the C++/OpenMP backend and extend it 
 
 ### Summary
 
-This blog post from the Intel PyTorch team provides an update on the performance optimizations made in the Inductor C++/OpenMP backend. The team has used a hybrid optimization strategy that leverages the oneDNN performance library to optimize Convolution/General Matrix Multiplication (GEMM) operations and Inductor C++ codegen to optimize element-wise and reduction operations. The team also uses weight pre-packing and post-operation fusion via the oneDNN library to further optimize performance. The post explains the technical details of these optimization techniques and provides performance data updates on TorchBench, HuggingFace, and TIMM.
+Vectorization optimization has been a significant improvement in Inductor CPP backend. The analysis shows that a big portion of kernels have already been vectorized. The remaining non-vectorized kernels have been categorized into 10 categories with suggested features as the next steps. With them, Inductor CPU’s performance can continue to be enhanced, making it a more efficient and effective tool for deep learning applications.
 
-Many thanks to @jansel , @desertfire , and @Chillee for their invaluable contributions and unwavering support during the development.
