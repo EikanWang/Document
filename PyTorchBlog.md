@@ -142,8 +142,44 @@ In addition to context analysis, the C++/OpenMP backend also incorporates severa
 - Data type demotion based on value range - [cpp.py](https://github.com/pytorch/pytorch/blob/fe05266fda4f908130dea7cbac37e9264c0429a2/torch/_inductor/codegen/cpp.py#L1647-#L1672)
 - Replacement of sleef implementation with oneDNN/oneMKL implementation for optimizing aten vectorization - [#94577](https://github.com/pytorch/pytorch/pull/94577), [#92289](https://github.com/pytorch/pytorch/pull/92289), [#91613](https://github.com/pytorch/pytorch/pull/91613)
 
-With all the optimizations, including weight prepack, post-op fusion, vectorization, and other miscellaneous optimizations, we have achieved promising performance improvements. 
+With all the optimizations, including weight prepack, post-op fusion, vectorization, and other miscellaneous optimizations, we have achieved promising performance improvements. And we will continously improve the performance. We examined vectorization optimization in Inductor CPP backend for FP32 training and inference of 150 benchmark models. 90% of inference kernels and 71% of training kernels are vectorized.
 
+In terms of inference, a total of 28,185 CPP kernels were generated, with 25,579 (90%) of them being vectorized, while the remaining 10% were scalar. As for training, 103,084 kernels were generated, with 73,909 (71%) being vectorized and 29% not vectorized. The results indicate that the vectorization of inference kernels is quite impressive, while there is still some work to be done in training kernels since we just started to work on the training. In the following section, we will analyze the non-vectorized kernels with specific examples to identify the most critical missing features.The remaining non-vectorized kernels are analyzed in 10 categories, highlighting the next steps to improve vectorization coverage: index-related operations, int64 support, vertical reduction, vectorization with fallback, and more.
+
+#### Dive into non-vectorized kernels
+
+The `CppVecKernelChecker` class and `CppTile2DKernelChecker` class in CPP codegen implement specific rules to determine the feasibility of vectorizing a kernel. A recent pull request 2 includes debug logs that help identify why a kernel may fail to vectorize by providing insight into the conditions that were not met. The information has been grouped into 10 categories to help understand the reasons for vectorization failure. The two charts below illustrate the frequency of occurrence of each category for three different benchmarks, one for inference and the other for training.
+
+![image](https://user-images.githubusercontent.com/55483091/235278849-5d4c9b97-abcc-4ccd-96da-b9daae97a622.png)
+![image](https://user-images.githubusercontent.com/55483091/235278867-8075496e-2f0a-4db2-ab10-c6e1796eab5b.png)
+
+##### index_expr
+
+The main limitation for vectorization is the absence of the support related to indices. Presently, the computation on indices is not vectorized, except for cases where a scalar index is broadcasted as a vector, which must remain constant with respect to the loop variable being vectorized. However, this check seems to prevent the vectorization of most index_expr.
+Below is an example from XGLMForCausalLM:
+
+```C++
+        #pragma omp for 
+        for(long i0=0; i0<1024; i0+=1)
+        {
+            #pragma GCC ivdep
+            for(long i1=0; i1<1024; i1+=1)
+            {
+                auto tmp0 = static_cast<long>(i1);
+                auto tmp1 = static_cast<long>(i0);
+                auto tmp2 = static_cast<long>(1);
+                auto tmp3 = tmp1 + tmp2;
+                auto tmp4 = tmp0 < tmp3;
+                auto tmp5 = static_cast<float>(0.0);
+                auto tmp6 = -std::numeric_limits<float>::infinity();
+                auto tmp7 = tmp4 ? tmp5 : tmp6;
+                out_ptr3[i1 + (1024*i0)] = tmp7;
+            }
+        }
+```
+
+In this context, “i1” serves as both the inner-most loop variable and an index expression. To enable vectorization on “i1”, we can set the initialization of “tmp0” with Vectorized::arrange. It’s important to note that this process also necessitates the ability to convert integer masks into floating masks, which is essential for creating a valid “blendv” operation for “where” that defines “tmp7”.
+There are more complicated cases (less frequently occurred than the previous one), e.g., an example from hf_BigBird below. Even though there are complex indices involving index_expr and computation and data loads that make vectorization challenging, there is still an advantage to vectorizing on i2 since the four stores are continuous along that axis. However, we may need to implement a “vectorization with fallback” mechanism to incorporate both scalar and vectorized code into the same loop body. The pull request found at [Inductor] simplify CPP backend Tile2D code by jgong5 · Pull Request #97626 · pytorch/pytorch · GitHub 1 is a part of this effort.
 
 The next step, we will continue optimizing the C++/OpenMP backend and extend it to support more data types as the next step. This includes:
 1. Low-precision (BF16 and INT8) inference optimization
