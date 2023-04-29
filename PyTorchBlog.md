@@ -141,3 +141,20 @@ In addition to context analysis, the C++/OpenMP backend also incorporates severa
 - Tiled kernel implementation for supporting transpose load  - [cpp.py](https://github.com/pytorch/pytorch/blob/fe05266fda4f908130dea7cbac37e9264c0429a2/torch/_inductor/codegen/cpp.py#L1211)
 - Data type demotion based on value range - [cpp.py](https://github.com/pytorch/pytorch/blob/fe05266fda4f908130dea7cbac37e9264c0429a2/torch/_inductor/codegen/cpp.py#L1647-#L1672)
 - Replacement of sleef implementation with oneDNN/oneMKL implementation for optimizing aten vectorization - [#94577](https://github.com/pytorch/pytorch/pull/94577), [#92289](https://github.com/pytorch/pytorch/pull/92289), [#91613](https://github.com/pytorch/pytorch/pull/91613)
+
+With all the optimizations, including weight prepack, post-op fusion, vectorization, and other miscellaneous optimizations, we have achieved promising performance improvements. 
+
+
+The next step, we will continue optimizing the C++/OpenMP backend and extend it to support more data types as the next step. This includes:
+1. Low-precision (BF16 and INT8) inference optimization
+2. Training optimization
+3. Loop tiling
+4. Autotune
+5. Further fusion optimization of Conv/GEMM kernels.
+6. Explore alternative codegen paths: clang/llvm/triton
+
+### Summary
+
+This blog post from the Intel PyTorch team provides an update on the performance optimizations made in the Inductor C++/OpenMP backend. The team has used a hybrid optimization strategy that leverages the oneDNN performance library to optimize Convolution/General Matrix Multiplication (GEMM) operations and Inductor C++ codegen to optimize element-wise and reduction operations. The team also uses weight pre-packing and post-operation fusion via the oneDNN library to further optimize performance. The post explains the technical details of these optimization techniques and provides performance data updates on TorchBench, HuggingFace, and TIMM.
+
+Many thanks to @jansel , @desertfire , and @Chillee for their invaluable contributions and unwavering support during the development.
