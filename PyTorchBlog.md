@@ -1,8 +1,4 @@
-In our previous [blog post](https://dev-discuss.pytorch.org/t/Inductor-update-4-cpu-backend-started-to-show-promising-performance-boost/874), @jgong5 shared the progress and plan about the optimization work for the Inductor C++/OpenMP backend. In this post, I’m going to refresh the performance data and have a technical deep-dive into those key optimization techniques used to achieve this improved performance.
-
-### Performance Update
-
-We employed the hybrid strategy to optimize the Inductor CPU backend. We categorize the ops into two types: Conv/GEMM and non-Conv/GEMM element-wise and reduction ops, leveraging oneDNN performance library to optimize the former and Inductor C++ codegen to optimize the latter. We applied post-op fusion and weight prepacking with oneDNN library and applied explicit vectorization in C++ codegen to get the optimal performance as measured on popular deep learning models.
+We have utilized a hybrid strategy to optimize the Inductor CPU backend. This strategy involves categorizing the operations into two types: Conv/GEMM and non-Conv/GEMM element-wise and reduction ops. To optimize the former, we leveraged the oneDNN performance library by applying post-op fusion and weight prepacking. While for the latter, we utilized Inductor C++ codegen by applying explicit vectorization in C++ codegen to obtain optimal performance, as measured on popular deep learning models. This hybrid strategy has shown promising results in terms of performance improvements compared to eager mode with these optimizations.
 
 Compared to eager mode with these optimizations, the C++/OpenMP backend shows promising performance improvements. We measured the performance of the three Inductor benchmark suites – TorchBench, HuggingFace, and TIMM – and the results are as follows. Additionally, we publish our performance data twice per week on GitHub at https://github.com/pytorch/pytorch/issues/93531.
 
@@ -142,7 +138,7 @@ In addition to context analysis, the C++/OpenMP backend also incorporates severa
 - Data type demotion based on value range - [cpp.py](https://github.com/pytorch/pytorch/blob/fe05266fda4f908130dea7cbac37e9264c0429a2/torch/_inductor/codegen/cpp.py#L1647-#L1672)
 - Replacement of sleef implementation with oneDNN/oneMKL implementation for optimizing aten vectorization - [#94577](https://github.com/pytorch/pytorch/pull/94577), [#92289](https://github.com/pytorch/pytorch/pull/92289), [#91613](https://github.com/pytorch/pytorch/pull/91613)
 
-With all the optimizations, including weight prepack, post-op fusion, vectorization, and other miscellaneous optimizations, we have achieved promising performance improvements. And we will continously improve the performance. We examined vectorization optimization in Inductor CPP backend for FP32 training and inference of 150 benchmark models. 90% of inference kernels and 71% of training kernels are vectorized.
+With all the optimizations, including weight prepack, post-op fusion, vectorization, and other miscellaneous optimizations, we have achieved promising performance improvements. We examined vectorization optimization in Inductor CPP backend for FP32 training and inference of 150 benchmark models. 90% of inference kernels and 71% of training kernels are vectorized.
 
 In terms of inference, a total of 28,185 CPP kernels were generated, with 25,579 (90%) of them being vectorized, while the remaining 10% were scalar. As for training, 103,084 kernels were generated, with 73,909 (71%) being vectorized and 29% not vectorized. The results indicate that the vectorization of inference kernels is quite impressive, while there is still some work to be done in training kernels since we just started to work on the training. In the following section, we will analyze the non-vectorized kernels with specific examples to identify the most critical missing features.The remaining non-vectorized kernels are analyzed in 10 categories, highlighting the next steps to improve vectorization coverage: index-related operations, int64 support, vertical reduction, vectorization with fallback, and more.
 
@@ -284,6 +280,8 @@ for(long i0=0; i0<32; i0+=1)
 ##### 5. unsupported dtype in load/store
 
 Similarly to the “dtype” case, the int64 and double vectorized data types are unsupported. Supporting vectorization for these types requires matching the number of vector lanes if we also want to vectorize float32 and/or int32 simultaneously. To accomplish this, we may need to use two vector variables to hold int64 or double vectors to match one float32 or int32 vector variable.
+Based on real benchmarks, the majority of cases where vectorization is lacking is due to the absence of int64 vectorization support. These cases fall into two main scenarios: 1) int64 is loaded for indirect indexing, and 2) int64 is loaded for computation, as illustrated in the examples from fastNLP_Bert below. In the first example, we do not need to vectorize the int64 variables “tmp0”, “tmp2” and “tmp5” since the loaded variables are invariant to “i1” which is being vectorized. However, int64 vectorization support is necessary for the second example.
+
 ```C++
 // We do not need to vectorize tmp0, tmp2 and tmp5 since they are invariant to i1
 #pragma omp for 
@@ -399,10 +397,8 @@ Vectorization is not implemented for constant of data type uint8 or bool. They h
 
 “atomic_add” cannot be vectorized. Still, we can do vectorization with fallback to maximize the performance, e.g., from AlbertForMaskedLM, we are able to vectorize all the ops except for atomic_add which can be put into an inner loop.
 
-Based on real benchmarks, the majority of cases where vectorization is lacking is due to the absence of int64 vectorization support. These cases fall into two main scenarios: 1) int64 is loaded for indirect indexing, and 2) int64 is loaded for computation, as illustrated in the examples from fastNLP_Bert below. In the first example, we do not need to vectorize the int64 variables “tmp0”, “tmp2” and “tmp5” since the loaded variables are invariant to “i1” which is being vectorized. However, int64 vectorization support is necessary for the second example.
-
 The next step, we will continue optimizing the C++/OpenMP backend and extend it to support more data types as the next step. This includes:
-1. Low-precision (BF16 and INT8) inference optimization
+1. Improve vectorization coverage
 2. Training optimization
 3. Loop tiling
 4. Autotune
