@@ -362,6 +362,8 @@ for(long i0=0; i0<1000; i0+=1)
         out_ptr0[i0] = tmp1;
     }
 }
+```
+
 The second case involves complicated indexing formulas such as floor division (//) or ModularIndexing, and in order to achieve maximum vectorization scope, we must rely on “vectorization with fallback”.
 
 ##### 7. unsupported ops
