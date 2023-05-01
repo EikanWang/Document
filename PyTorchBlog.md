@@ -29,6 +29,8 @@ Geometric mean speedup (Single-core Single-thread)
 +----------+------------+-------------+-------------+
 ~~~
 
+TODO: Add detailed model performance here.
+
 ### Technical Deep Dive
 
 Now, let's take a closer look at the two primary optimizations used in the Inductor C++/OpenMP backend: weight prepacking and post-operation fusion via oneDNN library and explicit vectorization in Inductor C++ codegen. 
@@ -149,256 +151,19 @@ The `CppVecKernelChecker` class and `CppTile2DKernelChecker` class in CPP codege
 ![image](https://user-images.githubusercontent.com/55483091/235278849-5d4c9b97-abcc-4ccd-96da-b9daae97a622.png)
 ![image](https://user-images.githubusercontent.com/55483091/235278867-8075496e-2f0a-4db2-ab10-c6e1796eab5b.png)
 
-##### 1. index_expr
+- **_index_expr_**: The main limitation for vectorization is the absence of the support related to indices. Presently, the computation on indices is not vectorized, except for cases where a scalar index is broadcasted as a vector, which must remain constant with respect to the loop variable being vectorized.
+- **_to_dtype_**: At present, we don’t provide support for vectorization of int64 and double data types. Supporting vectorization for these types requires matching the number of vector lanes if we also want to vectorize float32 and/or int32 simultaneously. To accomplish this, we may need to use two vector variables to hold int64 or double vectors to match one float32 or int32 vector variable. The problems with the “to_dtype” function are specifically connected to these two data types. In the majority of real benchmarks, int64 and double are commonly utilized by the calculation of scalar indices, making vectorization unnecessary.
+- **_indirect_indexing_**: We exclude all indirect indexing cases from vectorization, but upon observation, we find that we can still vectorize some cases when the indirect index variables remain constant with respect to the loop variables we want to vectorize. 
+- **_Unsupported** masked_: We vectorize the kernel containing “masked” op conservatively and don’t allow any actual computation inside it. This means that cases with nested masked bodies or computations within the “masked” element cannot be vectorized, such as the one found in jx_nest_base.
+- **_Unsupported dtype in load/store_**: Similarly to the “dtype” case, the int64 and double vectorized data types are unsupported. Supporting vectorization for these types requires matching the number of vector lanes if we also want to vectorize float32 and/or int32 simultaneously. To accomplish this, we may need to use two vector variables to hold int64 or double vectors to match one float32 or int32 vector variable.
+Based on real benchmarks, the majority of cases where vectorization is lacking is due to the absence of int64 vectorization support. These cases fall into two main scenarios: 1) int64 is loaded for indirect indexing, and 2) int64 is loaded for computation.
+- **_non-contiguous load/store (excluding indirect indexing)_**: `CppTile2DKernel` with 2d transposition support has already vectorized some of the non-contiguous load/store. However, there are still two main cases that have not been covered yet. The first case occurs frequently in most models during training backward, where the non-contiguous load/store happens on the inner-most reduction loop while being contiguous on an outer parallel loop, which is known as vertical reduction.
+- **_Unsupported ops_**: We currently do not support vectorization for some operations such as bitwise_and, bitwise_or, bitwise_xor, logical_not, remainder, truediv, among others. However, most of these operations should be easy to support. Although there are a few instances of “randn” which are difficult to vectorize, they occur infrequently.
+- **_Unsupported reduction_**: The main reason for the lack of support for reduction operations is primarily attributed to the absence of support for int64 vectorization.
+- **_Unsupported constant dtype_**: Vectorization is not implemented for constant of data type uint8 or bool. They happen less frequently and can be handled as low priority.
+- **_Unsupported store modes_**:  “atomic_add” cannot be vectorized. Still, we can do vectorization with fallback to maximize the performance, e.g., from AlbertForMaskedLM, we are able to vectorize all the ops except for atomic_add which can be put into an inner loop.
 
-The main limitation for vectorization is the absence of the support related to indices. Presently, the computation on indices is not vectorized, except for cases where a scalar index is broadcasted as a vector, which must remain constant with respect to the loop variable being vectorized. However, this check seems to prevent the vectorization of most index_expr.
-Below is an example from XGLMForCausalLM:
-
-```C++
-#pragma omp for 
-for(long i0=0; i0<1024; i0+=1)
-{
-    #pragma GCC ivdep
-    for(long i1=0; i1<1024; i1+=1)
-    {
-        auto tmp0 = static_cast<long>(i1);
-        auto tmp1 = static_cast<long>(i0);
-        auto tmp2 = static_cast<long>(1);
-        auto tmp3 = tmp1 + tmp2;
-        auto tmp4 = tmp0 < tmp3;
-        auto tmp5 = static_cast<float>(0.0);
-        auto tmp6 = -std::numeric_limits<float>::infinity();
-        auto tmp7 = tmp4 ? tmp5 : tmp6;
-        out_ptr3[i1 + (1024*i0)] = tmp7;
-    }
-}
-```
-
-In this context, “i1” serves as both the inner-most loop variable and an index expression. To enable vectorization on “i1”, we can set the initialization of “tmp0” with Vectorized::arrange. It’s important to note that this process also necessitates the ability to convert integer masks into floating masks, which is essential for creating a valid “blendv” operation for “where” that defines “tmp7”.
-There are more complicated cases (less frequently occurred than the previous one), e.g., an example from hf_BigBird below. Even though there are complex indices involving index_expr and computation and data loads that make vectorization challenging, there is still an advantage to vectorizing on i2 since the four stores are continuous along that axis. However, we may need to implement a “vectorization with fallback” mechanism to incorporate both scalar and vectorized code into the same loop body. The pull request found at [Inductor] simplify CPP backend Tile2D code by jgong5 · Pull Request #97626 · pytorch/pytorch · GitHub 1 is a part of this effort.
-
-##### 2. to_dtype
-
-At present, we don’t provide support for vectorization of int64 and double data types. Supporting vectorization for these types requires matching the number of vector lanes if we also want to vectorize float32 and/or int32 simultaneously. To accomplish this, we may need to use two vector variables to hold int64 or double vectors to match one float32 or int32 vector variable. The problems with the “to_dtype” function are specifically connected to these two data types. In the majority of real benchmarks, int64 and double are commonly utilized by the calculation of scalar indices, making vectorization unnecessary.
-Below is an example from hrnet_w18. In this particular scenario, we don’t need to vectorize the int64 and double indices since they have no relation to i3, which is the index we want to vectorize. Hence, it suffices to leave them as scalar and not perform vectorization on them.
-
-```C++
-#pragma omp for 
-for(long i0=0; i0<128; i0+=1)
-{
-    #pragma GCC ivdep
-    for(long i1=0; i1<56; i1+=1)
-    {
-        #pragma GCC ivdep
-        for(long i2=0; i2<56; i2+=1)
-        {
-            #pragma GCC ivdep
-            for(long i3=0; i3<18; i3+=1)
-            {
-                auto tmp0 = in_ptr0[i3 + (18*i2) + (1008*i1) + (56448*i0)];
-                auto tmp1 = static_cast<long>(i1);
-                auto tmp2 = static_cast<double>(tmp1);
-                auto tmp3 = static_cast<double>(1);
-                auto tmp4 = tmp2 * tmp3;
-                auto tmp5 = static_cast<double>(0);
-                auto tmp6 = tmp4 + tmp5;
-                auto tmp7 = static_cast<float>(tmp6);
-                auto tmp8 = static_cast<float>(0.5);
-                auto tmp9 = tmp7 * tmp8;
-                auto tmp10 = static_cast<long>(tmp9);
-                auto tmp11 = static_cast<long>(i2);
-                auto tmp12 = static_cast<double>(tmp11);
-                auto tmp13 = tmp12 * tmp3;
-                auto tmp14 = tmp13 + tmp5;
-                auto tmp15 = static_cast<float>(tmp14);
-                auto tmp16 = tmp15 * tmp8;
-                auto tmp17 = static_cast<long>(tmp16);
-                auto tmp18 = in_ptr1[i3 + (18*tmp17) + (504*tmp10) + (14112*i0)];
-                auto tmp19 = tmp0 + tmp18;
-                auto tmp20 = tmp19 * (tmp19>0);
-                out_ptr0[i3 + (18*i2) + (1008*i1) + (56448*i0)] = tmp20;
-            }
-        }
-    }
-}
-```
-
-##### 3. indirect_indexing
-
-We exclude all indirect indexing cases from vectorization, but upon observation, we find that we can still vectorize some cases when the indirect index variables remain constant with respect to the loop variables we want to vectorize. One instance of this can be seen in the “dtype” section, where the variable “tmp18” is a load with indirect indices. However, these indices are only dependent on “i1” and “i2” and not on “i3” which is the loop variable we want to vectorize. To obtain this information, we would require an analysis pass to track the relationships between the variables and each loop variable.
-
-##### 4. unsupported masked
-
-We vectorize the kernel containing “masked” op conservatively and don’t allow any actual computation inside it. This means that cases with nested masked bodies or computations within the “masked” element cannot be vectorized, such as the one found in jx_nest_base. However, in most cases like the example below, enabling vectorization for computation would not pose any issue.
-
-```C++
-#pragma omp for 
-for(long i0=0; i0<32; i0+=1)
-{
-    #pragma GCC ivdep
-    for(long i1=0; i1<57; i1+=1)
-    {
-        #pragma GCC ivdep
-        for(long i2=0; i2<57; i2+=1)
-        {
-            #pragma GCC ivdep
-            for(long i3=0; i3<256; i3+=1)
-            {
-                auto tmp0 = static_cast<long>(i1);
-                auto tmp1 = static_cast<long>(56);
-                auto tmp2 = tmp0 < tmp1;
-                auto tmp3 = static_cast<long>(i2);
-                auto tmp4 = tmp3 < tmp1;
-                auto tmp5 = tmp2 & tmp4;
-                auto tmp6 = [&]
-                {
-                    auto tmp7 = in_ptr0[i3 + (256*i2) + (14336*i1) + (802816*i0)];
-                    auto tmp8 = in_out_ptr0[i2 + (56*i1) + (3136*i0)];
-                    auto tmp9 = tmp7 - tmp8;
-                    auto tmp10 = out_ptr1[i2 + (56*i1) + (3136*i0)];
-                    auto tmp11 = static_cast<float>(256);
-                    auto tmp12 = tmp10 / tmp11;
-                    auto tmp13 = static_cast<float>(1e-06);
-                    auto tmp14 = tmp12 + tmp13;
-                    auto tmp15 = 1 / std::sqrt(tmp14);
-                    auto tmp16 = tmp9 * tmp15;
-                    auto tmp17 = in_ptr1[i3];
-                    auto tmp18 = tmp16 * tmp17;
-                    auto tmp19 = in_ptr2[i3];
-                    auto tmp20 = tmp18 + tmp19;
-                    return tmp20;
-                }
-                ;
-                auto tmp21 = tmp5 ? tmp6() : -std::numeric_limits<decltype(tmp6())>::infinity();
-                out_ptr2[i3 + (256*i2) + (14592*i1) + (831744*i0)] = tmp21;
-            }
-        }
-    }
-}
-```
-
-##### 5. unsupported dtype in load/store
-
-Similarly to the “dtype” case, the int64 and double vectorized data types are unsupported. Supporting vectorization for these types requires matching the number of vector lanes if we also want to vectorize float32 and/or int32 simultaneously. To accomplish this, we may need to use two vector variables to hold int64 or double vectors to match one float32 or int32 vector variable.
-Based on real benchmarks, the majority of cases where vectorization is lacking is due to the absence of int64 vectorization support. These cases fall into two main scenarios: 1) int64 is loaded for indirect indexing, and 2) int64 is loaded for computation, as illustrated in the examples from fastNLP_Bert below. In the first example, we do not need to vectorize the int64 variables “tmp0”, “tmp2” and “tmp5” since the loaded variables are invariant to “i1” which is being vectorized. However, int64 vectorization support is necessary for the second example.
-
-```C++
-// We do not need to vectorize tmp0, tmp2 and tmp5 since they are invariant to i1
-#pragma omp for 
-for(long i0=0; i0<475; i0+=1)
-{
-    {
-        float tmp8 = 0;
-        for(long i1=0; i1<768; i1+=1)
-        {
-            auto tmp0 = in_ptr0[i0];
-            auto tmp5 = in_ptr3[i0];
-            auto tmp1 = in_ptr1[i1 + (768*tmp0)];
-            auto tmp2 = static_cast<long>(i0);
-            auto tmp3 = in_ptr2[i1 + (768*tmp2)];
-            auto tmp4 = tmp1 + tmp3;
-            auto tmp6 = in_ptr4[i1 + (768*tmp5)];
-            auto tmp7 = tmp4 + tmp6;
-            out_ptr0[i1 + (768*i0)] = tmp7;
-            tmp8 += tmp7;
-        }
-        out_ptr1[i0] = tmp8;
-    }
-}
-```
-```C+++
-// vectorization on tmp4 is needed since it is variant to i1
-#pragma omp for 
-for(long i0=0; i0<5700; i0+=1)
-{
-    {
-        float tmp10 = -std::numeric_limits<float>::infinity();
-        for(long i1=0; i1<475; i1+=1)
-        {
-            auto tmp0 = in_ptr0[i1 + (475*i0)];
-            auto tmp4 = in_ptr1[i1];
-            auto tmp1 = static_cast<float>(8.0);
-            auto tmp2 = tmp0 / tmp1;
-            auto tmp3 = static_cast<float>(1.0);
-            auto tmp5 = static_cast<float>(tmp4);
-            auto tmp6 = tmp3 - tmp5;
-            auto tmp7 = static_cast<float>(-10000.0);
-            auto tmp8 = tmp6 * tmp7;
-            auto tmp9 = tmp2 + tmp8;
-            tmp10 = std::max(tmp10, tmp9);
-        }
-        out_ptr0[i0] = tmp10;
-    }
-}
-```
-“Double” is used as scalar in all the cases we encounter, which makes the vectorization unnecessary.
-In addition to int64 and double, we only support vectorized bool and uint8 when they are used as masks. There are small number of cases where uint8 is stored as bool, e.g., an example from DebertaForQuestionAnswering. Vectorization on them would be straightforward since their type sizes match, meanwhile we have to be careful if there are types of different sizes in the same kernel.
-```C++
-#pragma omp for 
-for(long i0=0; i0<2097152; i0+=1)
-{
-    auto tmp0 = in_ptr0[i0];
-    auto tmp1 = static_cast<bool>(tmp0);
-    auto tmp2 = tmp1 == 0;
-    out_ptr0[i0] = tmp2;
-}
-```
-
-##### 6. non-contiguous load/store (excluding indirect indexing)
-
-CppTile2DKernel with 2d transposition support has already vectorized some of the non-contiguous load/store. However, there are still two main cases that have not been covered yet. The first case occurs frequently in most models during training backward, where the non-contiguous load/store happens on the inner-most reduction loop while being contiguous on an outer parallel loop, which is known as vertical reduction.
-
-```C++
-#pragma GCC ivdep
-for(long i0=0; i0<1000; i0+=1)
-{
-    {
-        float tmp1 = 0;
-        for(long i1=0; i1<128; i1+=1)
-        {
-            auto tmp0 = in_ptr0[i0 + (1000*i1)];
-            tmp1 += tmp0;
-        }
-        out_ptr0[i0] = tmp1;
-    }
-}
-```
-
-The second case involves complicated indexing formulas such as floor division (//) or ModularIndexing, and in order to achieve maximum vectorization scope, we must rely on “vectorization with fallback”.
-
-##### 7. unsupported ops
-
-We currently do not support vectorization for some operations such as bitwise_and, bitwise_or, bitwise_xor, logical_not, remainder, truediv, among others. However, most of these operations should be easy to support. Although there are a few instances of “randn” which are difficult to vectorize, they occur infrequently.
-
-##### 8. unsupported reduction
-
-The main reason for the lack of support for reduction operations is primarily attributed to the absence of support for int64 vectorization, e.g., from fastNLP_Bert:
-
-```C++
-#pragma GCC ivdep
-for(long i0=0; i0<6; i0+=1)
-{
-    {
-        long tmp2 = 0;
-        for(long i1=0; i1<474; i1+=1)
-        {
-            auto tmp0 = out_ptr0[i1 + (474*i0)];
-            auto tmp1 = static_cast<long>(tmp0);
-            tmp2 += tmp1;
-        }
-        out_ptr2[i0] = tmp2;
-    }
-}
-```
-
-##### 9. unsupported constant dtype
-
-Vectorization is not implemented for constant of data type uint8 or bool. They happen less frequently and can be handled as low priority.
-
-##### 10. unsupported store modes
-
-“atomic_add” cannot be vectorized. Still, we can do vectorization with fallback to maximize the performance, e.g., from AlbertForMaskedLM, we are able to vectorize all the ops except for atomic_add which can be put into an inner loop.
-
+### Next Step
 The next step, we will continue optimizing the C++/OpenMP backend and extend it to support more data types as the next step. This includes:
 1. Improve vectorization coverage
 2. Training optimization
