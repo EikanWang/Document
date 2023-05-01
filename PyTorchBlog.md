@@ -142,7 +142,7 @@ With all the optimizations, including weight prepack, post-op fusion, vectorizat
 
 In terms of inference, a total of 28,185 CPP kernels were generated, with 25,579 (90%) of them being vectorized, while the remaining 10% were scalar. As for training, 103,084 kernels were generated, with 73,909 (71%) being vectorized and 29% not vectorized. The results indicate that the vectorization of inference kernels is quite impressive, while there is still some work to be done in training kernels since we just started to work on the training. In the following section, we will analyze the non-vectorized kernels with specific examples to identify the most critical missing features.The remaining non-vectorized kernels are analyzed in 10 categories, highlighting the next steps to improve vectorization coverage: index-related operations, int64 support, vertical reduction, vectorization with fallback, and more.
 
-#### Dive into non-vectorized kernels
+#### Non-Vectorization Scenarios
 
 The `CppVecKernelChecker` class and `CppTile2DKernelChecker` class in CPP codegen implement specific rules to determine the feasibility of vectorizing a kernel. A recent pull request 2 includes debug logs that help identify why a kernel may fail to vectorize by providing insight into the conditions that were not met. The information has been grouped into 10 categories to help understand the reasons for vectorization failure. The two charts below illustrate the frequency of occurrence of each category for three different benchmarks, one for inference and the other for training.
 
